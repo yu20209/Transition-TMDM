@@ -4,86 +4,82 @@ import torch.nn.functional as F
 
 
 class ConditionalLinear(nn.Module):
-    def __init__(self, num_in, num_out, n_steps):
+    def __init__(self, input_dim, output_dim, num_steps):
         super(ConditionalLinear, self).__init__()
-        self.num_out = num_out
-        self.lin = nn.Linear(num_in, num_out)
-        self.embed = nn.Embedding(n_steps, num_out)
-        self.embed.weight.data.uniform_()
+        self.output_dim = output_dim
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.step_embedding = nn.Embedding(num_steps, output_dim)
+        self.step_embedding.weight.data.uniform_()
 
-    def forward(self, x, t):
-        out = self.lin(x)
-        gamma = self.embed(t)
-        out = gamma.view(t.size()[0], -1, self.num_out) * out
-        return out
+    def forward(self, input_tensor, step_ids):
+        linear_out = self.linear(input_tensor)
+        step_scale = self.step_embedding(step_ids)
+        conditioned_out = step_scale.view(step_ids.size()[0], -1, self.output_dim) * linear_out
+        return conditioned_out
 
 
 class ConditionalGuidedModel(nn.Module):
     """
-    The diffusion denoiser in TMDM.
-    过渡版中，这个网络仍然不变其功能本质：
-    它仍然预测噪声 eps_theta，
-    但现在是在 residual space 中工作。
+    Denoiser network in residual space.
+    It predicts epsilon_theta for noisy residual targets.
     """
 
-    def __init__(self, config, MTS_args):
+    def __init__(self, config, mts_args):
         super(ConditionalGuidedModel, self).__init__()
-        n_steps = config.diffusion.timesteps + 1
+        num_steps = config.diffusion.timesteps + 1
         self.cat_x = config.model.cat_x
-        self.cat_y_pred = config.model.cat_y_pred
+        self.cat_prior_mean = config.model.cat_y_pred
 
-        self.c_out = MTS_args.c_out
-        self.x_embed_dim = MTS_args.CART_input_x_embed_dim
+        self.output_dim = mts_args.c_out
+        self.history_feature_dim = mts_args.CART_input_x_embed_dim
 
-        # 动态输入维度
-        # 原版代码这里写死成了 14 / 7，这在改造版里很容易出错
-        if self.cat_y_pred:
-            # concat(y_t, y_0_hat)
-            data_dim = self.c_out * 2
+        if self.cat_prior_mean:
+            # concat(noisy_target, prior_mean)
+            input_dim = self.output_dim * 2
         elif self.cat_x:
-            # concat(y_t, x_emb)
-            data_dim = self.c_out + self.x_embed_dim
+            # concat(noisy_target, history_feature)
+            input_dim = self.output_dim + self.history_feature_dim
         else:
-            data_dim = self.c_out
+            input_dim = self.output_dim
 
         hidden_dim = 128
 
-        self.lin1 = ConditionalLinear(data_dim, hidden_dim, n_steps)
-        self.lin2 = ConditionalLinear(hidden_dim, hidden_dim, n_steps)
-        self.lin3 = ConditionalLinear(hidden_dim, hidden_dim, n_steps)
-        self.lin4 = nn.Linear(hidden_dim, self.c_out)
+        self.layer1 = ConditionalLinear(input_dim, hidden_dim, num_steps)
+        self.layer2 = ConditionalLinear(hidden_dim, hidden_dim, num_steps)
+        self.layer3 = ConditionalLinear(hidden_dim, hidden_dim, num_steps)
+        self.output_layer = nn.Linear(hidden_dim, self.output_dim)
 
-    def forward(self, x, y_t, y_0_hat, t):
+    def forward(self, history_feature, noisy_target, prior_mean, step_ids):
         """
         Args:
-            x:      encoded history features, [B, L, x_embed_dim]
-            y_t:    noisy target at timestep t, [B, L, C]
-            y_0_hat:condition mean / prior mean, [B, L, C]
-            t:      timestep ids, [B]
+            history_feature: [B, L, history_feature_dim]
+            noisy_target:    [B, L, C]
+            prior_mean:      [B, L, C]
+            step_ids:        [B]
         """
-        if self.cat_y_pred:
-            eps_pred = torch.cat((y_t, y_0_hat), dim=-1)
+        if self.cat_prior_mean:
+            denoiser_input = torch.cat((noisy_target, prior_mean), dim=-1)
         elif self.cat_x:
-            eps_pred = torch.cat((y_t, x), dim=-1)
+            denoiser_input = torch.cat((noisy_target, history_feature), dim=-1)
         else:
-            eps_pred = y_t
+            denoiser_input = noisy_target
 
-        if y_t.device.type == 'mps':
-            eps_pred = self.lin1(eps_pred, t)
-            eps_pred = F.softplus(eps_pred.cpu()).to(y_t.device)
+        if noisy_target.device.type == 'mps':
+            denoiser_hidden = self.layer1(denoiser_input, step_ids)
+            denoiser_hidden = F.softplus(denoiser_hidden.cpu()).to(noisy_target.device)
 
-            eps_pred = self.lin2(eps_pred, t)
-            eps_pred = F.softplus(eps_pred.cpu()).to(y_t.device)
+            denoiser_hidden = self.layer2(denoiser_hidden, step_ids)
+            denoiser_hidden = F.softplus(denoiser_hidden.cpu()).to(noisy_target.device)
 
-            eps_pred = self.lin3(eps_pred, t)
-            eps_pred = F.softplus(eps_pred.cpu()).to(y_t.device)
+            denoiser_hidden = self.layer3(denoiser_hidden, step_ids)
+            denoiser_hidden = F.softplus(denoiser_hidden.cpu()).to(noisy_target.device)
         else:
-            eps_pred = F.softplus(self.lin1(eps_pred, t))
-            eps_pred = F.softplus(self.lin2(eps_pred, t))
-            eps_pred = F.softplus(self.lin3(eps_pred, t))
+            denoiser_hidden = F.softplus(self.layer1(denoiser_input, step_ids))
+            denoiser_hidden = F.softplus(self.layer2(denoiser_hidden, step_ids))
+            denoiser_hidden = F.softplus(self.layer3(denoiser_hidden, step_ids))
 
-        eps_pred = self.lin4(eps_pred)
-        return eps_pred
+        predicted_noise = self.output_layer(denoiser_hidden)
+        return predicted_noise
 
 
 class DeterministicFeedForwardNeuralNetwork(nn.Module):
