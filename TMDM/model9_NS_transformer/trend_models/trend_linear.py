@@ -4,13 +4,12 @@ import torch.nn as nn
 
 class TrendLinear(nn.Module):
     """
-    A very light-weight trend forecasting head.
-    Similar in spirit to channel-wise linear forecasting.
+    Lightweight trend forecasting head.
 
     Input:
-        x_trend: [B, seq_len, C]
+        history_trend: [B, seq_len, C]
     Output:
-        pred_trend: [B, pred_len, C]
+        future_trend_pred: [B, pred_len, C]
     """
 
     def __init__(self, configs):
@@ -27,22 +26,20 @@ class TrendLinear(nn.Module):
         else:
             self.linear = nn.Linear(self.seq_len, self.pred_len)
 
-    def forward(self, x_trend):
-        # x_trend: [B, seq_len, C]
-        B, L, C = x_trend.shape
-        assert C == self.channels
+    def forward(self, history_trend):
+        # history_trend: [B, seq_len, C]
+        batch_size, seq_len, num_channels = history_trend.shape
+        assert num_channels == self.channels
 
         if self.individual:
-            out = []
-            for i in range(C):
-                # [B, L] -> [B, pred_len]
-                out_i = self.linears[i](x_trend[:, :, i])
-                out.append(out_i.unsqueeze(-1))
-            out = torch.cat(out, dim=-1)  # [B, pred_len, C]
+            future_trend_pred_list = []
+            for channel_idx in range(num_channels):
+                future_trend_one_channel = self.linears[channel_idx](history_trend[:, :, channel_idx])
+                future_trend_pred_list.append(future_trend_one_channel.unsqueeze(-1))
+            future_trend_pred = torch.cat(future_trend_pred_list, dim=-1)
         else:
-            # [B, seq_len, C] -> [B, C, seq_len]
-            x_t = x_trend.permute(0, 2, 1)
-            out = self.linear(x_t)        # [B, C, pred_len]
-            out = out.permute(0, 2, 1)    # [B, pred_len, C]
+            history_trend_t = history_trend.permute(0, 2, 1)
+            future_trend_pred = self.linear(history_trend_t)
+            future_trend_pred = future_trend_pred.permute(0, 2, 1)
 
-        return out
+        return future_trend_pred
