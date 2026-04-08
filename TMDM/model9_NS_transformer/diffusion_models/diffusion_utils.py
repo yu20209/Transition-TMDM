@@ -19,111 +19,198 @@ def make_beta_schedule(schedule="linear", num_timesteps=1000, start=1e-5, end=1e
         max_beta = 0.999
         cosine_s = 0.008
         betas = torch.tensor(
-            [min(1 - (math.cos(((i + 1) / num_timesteps + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2) / (
-                    math.cos((i / num_timesteps + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2), max_beta) for i in
-             range(num_timesteps)])
+            [min(
+                1 - (math.cos(((i + 1) / num_timesteps + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2) /
+                (math.cos((i / num_timesteps + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2),
+                max_beta
+            ) for i in range(num_timesteps)]
+        )
         if schedule == "cosine_reverse":
-            betas = betas.flip(0)  # starts at max_beta then decreases fast
+            betas = betas.flip(0)
     elif schedule == "cosine_anneal":
         betas = torch.tensor(
-            [start + 0.5 * (end - start) * (1 - math.cos(t / (num_timesteps - 1) * math.pi)) for t in
-             range(num_timesteps)])
+            [start + 0.5 * (end - start) * (1 - math.cos(t / (num_timesteps - 1) * math.pi))
+             for t in range(num_timesteps)]
+        )
     return betas
 
 
-def extract(input, t, x):
-    shape = x.shape
-    out = torch.gather(input, 0, t.to(input.device))
-    reshape = [t.shape[0]] + [1] * (len(shape) - 1)
-    return out.reshape(*reshape)
+def extract(schedule_tensor, step_ids, reference_tensor):
+    reference_shape = reference_tensor.shape
+    extracted_value = torch.gather(schedule_tensor, 0, step_ids.to(schedule_tensor.device))
+    reshape_shape = [step_ids.shape[0]] + [1] * (len(reference_shape) - 1)
+    return extracted_value.reshape(*reshape_shape)
 
 
-# Forward functions
-def q_sample(y, y_0_hat, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, t, noise=None):
+# =========================
+# Forward process
+# =========================
+def q_sample(clean_target, prior_mean, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, step_ids, noise=None):
     """
-    y_0_hat: prediction of pre-trained guidance model; can be extended to represent
-        any prior mean setting at timestep T.
+    Forward diffusion:
+        q(target_t | target_0, prior_mean)
+
+    In the transition version:
+        clean_target = clean residual target
+        prior_mean   = residual prior mean
     """
     if noise is None:
-        noise = torch.randn_like(y).to(y.device)
-    sqrt_alpha_bar_t = extract(alphas_bar_sqrt, t, y)
-    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, t, y)
-    # q(y_t | y_0, x)
-    y_t = sqrt_alpha_bar_t * y + (1 - sqrt_alpha_bar_t) * y_0_hat + sqrt_one_minus_alpha_bar_t * noise
-    return y_t
+        noise = torch.randn_like(clean_target).to(clean_target.device)
+
+    sqrt_alpha_bar_t = extract(alphas_bar_sqrt, step_ids, clean_target)
+    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, step_ids, clean_target)
+
+    noisy_target = (
+        sqrt_alpha_bar_t * clean_target
+        + (1 - sqrt_alpha_bar_t) * prior_mean
+        + sqrt_one_minus_alpha_bar_t * noise
+    )
+    return noisy_target
 
 
-# Reverse function -- sample y_{t-1} given y_t
-def p_sample(model, x, x_mark, y, y_0_hat, y_T_mean, t, alphas, one_minus_alphas_bar_sqrt):
+# =========================
+# Reverse process: one step
+# =========================
+def p_sample(model, history_input, history_mark, noisy_target, prior_mean, prior_mean_T,
+             step_index, alphas, one_minus_alphas_bar_sqrt):
     """
-    Reverse diffusion process sampling -- one time step.
+    Reverse diffusion sampling for one step.
 
-    y: sampled y at time step t, y_t.
-    y_0_hat: prediction of pre-trained guidance model.
-    y_T_mean: mean of prior distribution at timestep T.
-    We replace y_0_hat with y_T_mean in the forward process posterior mean computation, emphasizing that 
-        guidance model prediction y_0_hat = f_phi(x) is part of the input to eps_theta network, while 
-        in paper we also choose to set the prior mean at timestep T y_T_mean = f_phi(x).
+    Args:
+        noisy_target: [B, L, C], current noisy target at timestep t
+        prior_mean:   [B, L, C], prior mean used as condition input to eps_theta
+        prior_mean_T: [B, L, C], mean of p(target_T)
     """
     device = next(model.parameters()).device
-    z = torch.randn_like(y)  # if t > 1 else torch.zeros_like(y)
-    t = torch.tensor([t]).to(device)
-    alpha_t = extract(alphas, t, y)
-    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, t, y)
-    sqrt_one_minus_alpha_bar_t_m_1 = extract(one_minus_alphas_bar_sqrt, t - 1, y)
+    gaussian_noise = torch.randn_like(noisy_target)
+    step_ids = torch.tensor([step_index]).to(device)
+
+    alpha_t = extract(alphas, step_ids, noisy_target)
+    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, step_ids, noisy_target)
+    sqrt_one_minus_alpha_bar_t_prev = extract(one_minus_alphas_bar_sqrt, step_ids - 1, noisy_target)
+
     sqrt_alpha_bar_t = (1 - sqrt_one_minus_alpha_bar_t.square()).sqrt()
-    sqrt_alpha_bar_t_m_1 = (1 - sqrt_one_minus_alpha_bar_t_m_1.square()).sqrt()
-    # y_t_m_1 posterior mean component coefficients
-    gamma_0 = (1 - alpha_t) * sqrt_alpha_bar_t_m_1 / (sqrt_one_minus_alpha_bar_t.square())
-    gamma_1 = (sqrt_one_minus_alpha_bar_t_m_1.square()) * (alpha_t.sqrt()) / (sqrt_one_minus_alpha_bar_t.square())
-    gamma_2 = 1 + (sqrt_alpha_bar_t - 1) * (alpha_t.sqrt() + sqrt_alpha_bar_t_m_1) / (
-        sqrt_one_minus_alpha_bar_t.square())
-    eps_theta = model(x, x_mark, 0, y, y_0_hat, t).to(device).detach()
-    # y_0 reparameterization
-    y_0_reparam = 1 / sqrt_alpha_bar_t * (
-            y - (1 - sqrt_alpha_bar_t) * y_T_mean - eps_theta * sqrt_one_minus_alpha_bar_t)
-    # posterior mean
-    y_t_m_1_hat = gamma_0 * y_0_reparam + gamma_1 * y + gamma_2 * y_T_mean
-    # posterior variance
-    beta_t_hat = (sqrt_one_minus_alpha_bar_t_m_1.square()) / (sqrt_one_minus_alpha_bar_t.square()) * (1 - alpha_t)
-    y_t_m_1 = y_t_m_1_hat.to(device) + beta_t_hat.sqrt().to(device) * z.to(device)
-    return y_t_m_1
+    sqrt_alpha_bar_t_prev = (1 - sqrt_one_minus_alpha_bar_t_prev.square()).sqrt()
+
+    posterior_coeff_clean = (1 - alpha_t) * sqrt_alpha_bar_t_prev / (sqrt_one_minus_alpha_bar_t.square())
+    posterior_coeff_noisy = (sqrt_one_minus_alpha_bar_t_prev.square()) * (alpha_t.sqrt()) / (
+        sqrt_one_minus_alpha_bar_t.square()
+    )
+    posterior_coeff_prior = 1 + (sqrt_alpha_bar_t - 1) * (alpha_t.sqrt() + sqrt_alpha_bar_t_prev) / (
+        sqrt_one_minus_alpha_bar_t.square()
+    )
+
+    predicted_noise = model(
+        history_input,
+        history_mark,
+        0,
+        noisy_target,
+        prior_mean,
+        step_ids
+    ).to(device).detach()
+
+    # Reconstruct clean target
+    reconstructed_clean_target = (
+        1 / sqrt_alpha_bar_t
+    ) * (
+        noisy_target
+        - (1 - sqrt_alpha_bar_t) * prior_mean_T
+        - predicted_noise * sqrt_one_minus_alpha_bar_t
+    )
+
+    posterior_mean = (
+        posterior_coeff_clean * reconstructed_clean_target
+        + posterior_coeff_noisy * noisy_target
+        + posterior_coeff_prior * prior_mean_T
+    )
+
+    posterior_variance = (
+        (sqrt_one_minus_alpha_bar_t_prev.square()) / (sqrt_one_minus_alpha_bar_t.square()) * (1 - alpha_t)
+    )
+
+    sampled_previous_target = posterior_mean.to(device) + posterior_variance.sqrt().to(device) * gaussian_noise.to(device)
+    return sampled_previous_target
 
 
-# Reverse function -- sample y_0 given y_1
-def p_sample_t_1to0(model, x, x_mark, y, y_0_hat, y_T_mean, one_minus_alphas_bar_sqrt):
+# =========================
+# Reverse process: t=1 -> 0
+# =========================
+def p_sample_t_1to0(model, history_input, history_mark, noisy_target, prior_mean, prior_mean_T,
+                    one_minus_alphas_bar_sqrt):
     device = next(model.parameters()).device
-    t = torch.tensor([0]).to(device)  # corresponding to timestep 1 (i.e., t=1 in diffusion models)
-    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, t, y)
+    step_ids = torch.tensor([0]).to(device)
+
+    sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, step_ids, noisy_target)
     sqrt_alpha_bar_t = (1 - sqrt_one_minus_alpha_bar_t.square()).sqrt()
-    eps_theta = model(x, x_mark, 0, y, y_0_hat, t).to(device).detach()
-    # y_0 reparameterization
-    y_0_reparam = 1 / sqrt_alpha_bar_t * (
-            y - (1 - sqrt_alpha_bar_t) * y_T_mean - eps_theta * sqrt_one_minus_alpha_bar_t)
-    y_t_m_1 = y_0_reparam.to(device)
-    return y_t_m_1
+
+    predicted_noise = model(
+        history_input,
+        history_mark,
+        0,
+        noisy_target,
+        prior_mean,
+        step_ids
+    ).to(device).detach()
+
+    reconstructed_clean_target = (
+        1 / sqrt_alpha_bar_t
+    ) * (
+        noisy_target
+        - (1 - sqrt_alpha_bar_t) * prior_mean_T
+        - predicted_noise * sqrt_one_minus_alpha_bar_t
+    )
+
+    return reconstructed_clean_target.to(device)
 
 
-def p_sample_loop(model, x, x_mark, y_0_hat, y_T_mean, n_steps, alphas, one_minus_alphas_bar_sqrt):
+# =========================
+# Reverse process: full loop
+# =========================
+def p_sample_loop(model, history_input, history_mark, prior_mean, prior_mean_T,
+                  num_steps, alphas, one_minus_alphas_bar_sqrt):
     device = next(model.parameters()).device
-    z = torch.randn_like(y_T_mean).to(device)
-    cur_y = z + y_T_mean  # sample y_T
-    y_p_seq = [cur_y]
-    for t in reversed(range(1, n_steps)):  # t from T to 2
-        y_t = cur_y
-        cur_y = p_sample(model, x, x_mark, y_t, y_0_hat, y_T_mean, t, alphas, one_minus_alphas_bar_sqrt)  # y_{t-1}
-        y_p_seq.append(cur_y)
-    assert len(y_p_seq) == n_steps
-    y_0 = p_sample_t_1to0(model, x, x_mark, y_p_seq[-1], y_0_hat, y_T_mean, one_minus_alphas_bar_sqrt)
-    y_p_seq.append(y_0)
-    return y_p_seq
+
+    terminal_noise = torch.randn_like(prior_mean_T).to(device)
+    current_target = terminal_noise + prior_mean_T  # sample target_T
+    target_sequence = [current_target]
+
+    for step_index in reversed(range(1, num_steps)):
+        noisy_target = current_target
+        current_target = p_sample(
+            model,
+            history_input,
+            history_mark,
+            noisy_target,
+            prior_mean,
+            prior_mean_T,
+            step_index,
+            alphas,
+            one_minus_alphas_bar_sqrt
+        )
+        target_sequence.append(current_target)
+
+    assert len(target_sequence) == num_steps
+
+    clean_target = p_sample_t_1to0(
+        model,
+        history_input,
+        history_mark,
+        target_sequence[-1],
+        prior_mean,
+        prior_mean_T,
+        one_minus_alphas_bar_sqrt
+    )
+    target_sequence.append(clean_target)
+    return target_sequence
 
 
-# Evaluation with KLD
-def kld(y1, y2, grid=(-20, 20), num_grid=400):
-    y1, y2 = y1.numpy().flatten(), y2.numpy().flatten()
-    p_y1, _ = np.histogram(y1, bins=num_grid, range=[grid[0], grid[1]], density=True)
-    p_y1 += 1e-7
-    p_y2, _ = np.histogram(y2, bins=num_grid, range=[grid[0], grid[1]], density=True)
-    p_y2 += 1e-7
-    return (p_y1 * np.log(p_y1 / p_y2)).sum()
+# =========================
+# Evaluation helper
+# =========================
+def kld(sample_a, sample_b, grid=(-20, 20), num_grid=400):
+    sample_a, sample_b = sample_a.numpy().flatten(), sample_b.numpy().flatten()
+    prob_a, _ = np.histogram(sample_a, bins=num_grid, range=[grid[0], grid[1]], density=True)
+    prob_a += 1e-7
+    prob_b, _ = np.histogram(sample_b, bins=num_grid, range=[grid[0], grid[1]], density=True)
+    prob_b += 1e-7
+    return (prob_a * np.log(prob_a / prob_b)).sum()
