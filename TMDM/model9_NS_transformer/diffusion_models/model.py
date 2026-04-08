@@ -14,36 +14,60 @@ class ConditionalLinear(nn.Module):
     def forward(self, x, t):
         out = self.lin(x)
         gamma = self.embed(t)
-        # out = gamma.view(-1, self.num_out) * out
-
         out = gamma.view(t.size()[0], -1, self.num_out) * out
         return out
 
 
 class ConditionalGuidedModel(nn.Module):
+    """
+    The diffusion denoiser in TMDM.
+    过渡版中，这个网络仍然不变其功能本质：
+    它仍然预测噪声 eps_theta，
+    但现在是在 residual space 中工作。
+    """
+
     def __init__(self, config, MTS_args):
         super(ConditionalGuidedModel, self).__init__()
         n_steps = config.diffusion.timesteps + 1
         self.cat_x = config.model.cat_x
         self.cat_y_pred = config.model.cat_y_pred
-        data_dim = 14
 
-        self.lin1 = ConditionalLinear(data_dim, 128, n_steps)
-        self.lin2 = ConditionalLinear(128, 128, n_steps)
-        self.lin3 = ConditionalLinear(128, 128, n_steps)
-        self.lin4 = nn.Linear(128, 7)
+        self.c_out = MTS_args.c_out
+        self.x_embed_dim = MTS_args.CART_input_x_embed_dim
+
+        # 动态输入维度
+        # 原版代码这里写死成了 14 / 7，这在改造版里很容易出错
+        if self.cat_y_pred:
+            # concat(y_t, y_0_hat)
+            data_dim = self.c_out * 2
+        elif self.cat_x:
+            # concat(y_t, x_emb)
+            data_dim = self.c_out + self.x_embed_dim
+        else:
+            data_dim = self.c_out
+
+        hidden_dim = 128
+
+        self.lin1 = ConditionalLinear(data_dim, hidden_dim, n_steps)
+        self.lin2 = ConditionalLinear(hidden_dim, hidden_dim, n_steps)
+        self.lin3 = ConditionalLinear(hidden_dim, hidden_dim, n_steps)
+        self.lin4 = nn.Linear(hidden_dim, self.c_out)
 
     def forward(self, x, y_t, y_0_hat, t):
-        if self.cat_x:
-            if self.cat_y_pred:
-                eps_pred = torch.cat((y_t, y_0_hat), dim=-1)
-            else:
-                eps_pred = torch.cat((y_t, x), dim=2)
+        """
+        Args:
+            x:      encoded history features, [B, L, x_embed_dim]
+            y_t:    noisy target at timestep t, [B, L, C]
+            y_0_hat:condition mean / prior mean, [B, L, C]
+            t:      timestep ids, [B]
+        """
+        if self.cat_y_pred:
+            eps_pred = torch.cat((y_t, y_0_hat), dim=-1)
+        elif self.cat_x:
+            eps_pred = torch.cat((y_t, x), dim=-1)
         else:
-            if self.cat_y_pred:
-                eps_pred = torch.cat((y_t, y_0_hat), dim=2)
-            else:
-                eps_pred = y_t
+            eps_pred = y_t
+
         if y_t.device.type == 'mps':
             eps_pred = self.lin1(eps_pred, t)
             eps_pred = F.softplus(eps_pred.cpu()).to(y_t.device)
@@ -53,27 +77,26 @@ class ConditionalGuidedModel(nn.Module):
 
             eps_pred = self.lin3(eps_pred, t)
             eps_pred = F.softplus(eps_pred.cpu()).to(y_t.device)
-
         else:
             eps_pred = F.softplus(self.lin1(eps_pred, t))
             eps_pred = F.softplus(self.lin2(eps_pred, t))
             eps_pred = F.softplus(self.lin3(eps_pred, t))
+
         eps_pred = self.lin4(eps_pred)
         return eps_pred
 
 
-# deterministic feed forward neural network
 class DeterministicFeedForwardNeuralNetwork(nn.Module):
 
     def __init__(self, dim_in, dim_out, hid_layers,
                  use_batchnorm=False, negative_slope=0.01, dropout_rate=0):
         super(DeterministicFeedForwardNeuralNetwork, self).__init__()
-        self.dim_in = dim_in  # dimension of nn input
-        self.dim_out = dim_out  # dimension of nn output
-        self.hid_layers = hid_layers  # nn hidden layer architecture
-        self.nn_layers = [self.dim_in] + self.hid_layers  # nn hidden layer architecture, except output layer
-        self.use_batchnorm = use_batchnorm  # whether apply batch norm
-        self.negative_slope = negative_slope  # negative slope for LeakyReLU
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.hid_layers = hid_layers
+        self.nn_layers = [self.dim_in] + self.hid_layers
+        self.use_batchnorm = use_batchnorm
+        self.negative_slope = negative_slope
         self.dropout_rate = dropout_rate
         layers = self.create_nn_layers()
         self.network = nn.Sequential(*layers)
@@ -93,21 +116,10 @@ class DeterministicFeedForwardNeuralNetwork(nn.Module):
         return self.network(x)
 
 
-# early stopping scheme for hyperparameter tuning
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
 
     def __init__(self, patience=10, delta=0):
-        """
-        Args:
-            patience (int): Number of steps to wait after average improvement is below certain threshold.
-                            Default: 10
-            delta (float): Minimum change in the monitored quantity to qualify as an improvement;
-                           shall be a small positive value.
-                           Default: 0
-            best_score: value of the best metric on the validation set.
-            best_epoch: epoch with the best metric on the validation set.
-        """
         self.patience = patience
         self.delta = delta
         self.counter = 0
@@ -116,7 +128,6 @@ class EarlyStopping:
         self.early_stop = False
 
     def __call__(self, val_cost, epoch, verbose=False):
-
         score = val_cost
 
         if self.best_score is None:
