@@ -7,10 +7,16 @@ class Exp_Basic(object):
     def __init__(self, args):
         self.args = args
         self.device = self._acquire_device()
-        model, cond_pred_model, cond_pred_model_train = self._build_model()
+
+        # 过渡版：现在 _build_model 返回 3 个模型：
+        # 1) diffusion model
+        # 2) residual condition model (原 TMDM 的 cond model，但现在预测 residual mean)
+        # 3) trend model
+        model, cond_pred_model, trend_model = self._build_model()
+
         self.model = model.to(self.device)
         self.cond_pred_model = cond_pred_model.to(self.device)
-        self.cond_pred_model_train = cond_pred_model_train.to(self.device)
+        self.trend_model = trend_model.to(self.device)
 
     def _build_model(self):
         raise NotImplementedError
@@ -27,8 +33,14 @@ class Exp_Basic(object):
                 device = torch.device('cpu')
                 print('Use CPU')
         else:
-            device_name = f'mps:0'
-            device = torch.device(device_name)
+            # 原仓库这里默认走 mps；如果你机器没有 mps，可改成 cpu
+            try:
+                device_name = 'mps:0'
+                device = torch.device(device_name)
+                print('Use MPS')
+            except Exception:
+                device = torch.device('cpu')
+                print('Use CPU')
         return device
 
     def _get_data(self):
