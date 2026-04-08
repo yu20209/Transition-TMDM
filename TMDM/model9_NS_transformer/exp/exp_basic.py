@@ -8,14 +8,14 @@ class Exp_Basic(object):
         self.args = args
         self.device = self._acquire_device()
 
-        # 过渡版：现在 _build_model 返回 3 个模型：
-        # 1) diffusion model
-        # 2) residual condition model (原 TMDM 的 cond model，但现在预测 residual mean)
-        # 3) trend model
-        model, cond_pred_model, trend_model = self._build_model()
+        # 过渡版：返回三个模型
+        # 1) residual diffusion model
+        # 2) residual prior mean model
+        # 3) trend forecasting model
+        model, residual_prior_model, trend_model = self._build_model()
 
         self.model = model.to(self.device)
-        self.cond_pred_model = cond_pred_model.to(self.device)
+        self.cond_pred_model = residual_prior_model.to(self.device)
         self.trend_model = trend_model.to(self.device)
 
     def _build_model(self):
@@ -33,10 +33,8 @@ class Exp_Basic(object):
                 device = torch.device('cpu')
                 print('Use CPU')
         else:
-            # 原仓库这里默认走 mps；如果你机器没有 mps，可改成 cpu
             try:
-                device_name = 'mps:0'
-                device = torch.device(device_name)
+                device = torch.device('mps:0')
                 print('Use MPS')
             except Exception:
                 device = torch.device('cpu')
