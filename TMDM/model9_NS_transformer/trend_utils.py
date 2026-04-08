@@ -2,80 +2,81 @@ import torch
 import torch.nn.functional as F
 
 
-def moving_average_trend(x, kernel_size):
+def moving_average_trend(input_series, kernel_size):
     """
     Extract trend component by moving average.
 
     Args:
-        x: [B, L, C]
+        input_series: [B, L, C]
         kernel_size: int
 
     Returns:
-        trend: [B, L, C]
+        trend_series: [B, L, C]
     """
     if kernel_size <= 1:
-        return x
+        return input_series
 
     pad = (kernel_size - 1) // 2
 
     # [B, L, C] -> [B, C, L]
-    x_t = x.permute(0, 2, 1)
+    input_series_t = input_series.permute(0, 2, 1)
 
-    # replicate padding to keep the same length
-    front = x_t[:, :, 0:1].repeat(1, 1, pad)
-    end = x_t[:, :, -1:].repeat(1, 1, pad)
-    x_pad = torch.cat([front, x_t, end], dim=2)
+    front = input_series_t[:, :, 0:1].repeat(1, 1, pad)
+    end = input_series_t[:, :, -1:].repeat(1, 1, pad)
+    input_series_pad = torch.cat([front, input_series_t, end], dim=2)
 
-    trend = F.avg_pool1d(x_pad, kernel_size=kernel_size, stride=1)
-    trend = trend.permute(0, 2, 1)
-    return trend
+    trend_series = F.avg_pool1d(input_series_pad, kernel_size=kernel_size, stride=1)
+    trend_series = trend_series.permute(0, 2, 1)
+    return trend_series
 
 
-def series_decomp(x, kernel_size):
+def series_decomp(input_series, kernel_size):
     """
     Moving-average decomposition:
-        x = trend + residual
+        input_series = trend_series + residual_series
     """
-    trend = moving_average_trend(x, kernel_size)
-    residual = x - trend
-    return trend, residual
+    trend_series = moving_average_trend(input_series, kernel_size)
+    residual_series = input_series - trend_series
+    return trend_series, residual_series
 
 
-def build_future_trend_context(x_trend, pred_trend, label_len):
+def build_future_trend_context(history_trend, future_trend_pred, label_len):
     """
-    Build the full trend sequence used in the decoder / residual target.
+    Build full trend sequence for decoder / residual target.
 
     Args:
-        x_trend:   [B, seq_len, C]
-        pred_trend:[B, pred_len, C]
+        history_trend:     [B, seq_len, C]
+        future_trend_pred: [B, pred_len, C]
         label_len: int
 
     Returns:
-        trend_full: [B, label_len + pred_len, C]
+        full_trend_context: [B, label_len + pred_len, C]
     """
-    trend_label = x_trend[:, -label_len:, :]
-    trend_full = torch.cat([trend_label, pred_trend], dim=1)
-    return trend_full
+    trend_label_context = history_trend[:, -label_len:, :]
+    full_trend_context = torch.cat([trend_label_context, future_trend_pred], dim=1)
+    return full_trend_context
 
 
-def build_residual_decoder_input(x_residual, pred_len, label_len):
+def build_residual_decoder_input(history_residual, pred_len, label_len):
     """
     Residual decoder input:
-        use the residual context from history for the label part,
-        and zeros for the future prediction slots.
+    use residual history for label part and zero placeholders for future part.
 
     Args:
-        x_residual: [B, seq_len, C]
+        history_residual: [B, seq_len, C]
 
     Returns:
-        dec_inp_res: [B, label_len + pred_len, C]
+        residual_decoder_input: [B, label_len + pred_len, C]
     """
-    zeros = torch.zeros(
-        x_residual.size(0),
+    future_zero_placeholder = torch.zeros(
+        history_residual.size(0),
         pred_len,
-        x_residual.size(2),
-        device=x_residual.device,
-        dtype=x_residual.dtype
+        history_residual.size(2),
+        device=history_residual.device,
+        dtype=history_residual.dtype
     )
-    dec_inp_res = torch.cat([x_residual[:, -label_len:, :], zeros], dim=1)
-    return dec_inp_res
+    residual_decoder_input = torch.cat(
+        [history_residual[:, -label_len:, :], future_zero_placeholder],
+        dim=1
+    )
+    return residual_decoder_input
