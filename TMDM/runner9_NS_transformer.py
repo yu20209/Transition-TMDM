@@ -8,13 +8,12 @@ import setproctitle
 if __name__ == '__main__':
     setproctitle.setproctitle('LYX_thread')
 
-    parser = argparse.ArgumentParser(description='Transition TMDM: trend decomposition + residual TMDM')
+    parser = argparse.ArgumentParser(description='Transition TMDM: trend decomposition + residual-space TMDM')
 
     # basic config
     parser.add_argument('--is_training', type=bool, default=True, help='status')
     parser.add_argument('--model_id', type=str, default='ETTh2_96_192_transition_tmdm', help='model id')
-    parser.add_argument('--model', type=str, default='Transition_TMDM',
-                        help='model name')
+    parser.add_argument('--model', type=str, default='Transition_TMDM', help='model name')
 
     # data loader
     parser.add_argument('--data', type=str, default='custom', help='dataset type')
@@ -23,8 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]')
     parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
-    parser.add_argument('--freq', type=str, default='h',
-                        help='freq for time features encoding')
+    parser.add_argument('--freq', type=str, default='h', help='freq for time features encoding')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
     # forecasting task
@@ -43,22 +41,20 @@ if __name__ == '__main__':
     parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
     parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
     parser.add_argument('--factor', type=int, default=3, help='attn factor')
-    parser.add_argument('--distil', action='store_false',
-                        help='whether to use distilling in encoder',
-                        default=True)
+    parser.add_argument('--distil', action='store_false', default=True,
+                        help='whether to use distilling in encoder')
     parser.add_argument('--dropout', type=float, default=0.05, help='dropout')
-    parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding')
+    parser.add_argument('--embed', type=str, default='timeF', help='time features encoding')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in encoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
 
     parser.add_argument('--k_z', type=float, default=1e-2, help='KL weight')
-    parser.add_argument('--k_cond', type=float, default=1.0, help='Residual condition weight')
-    parser.add_argument('--k_trend', type=float, default=1.0, help='Trend supervision weight')
+    parser.add_argument('--k_cond', type=float, default=1.0, help='residual prior loss weight')
+    parser.add_argument('--k_trend', type=float, default=1.0, help='trend loss weight')
     parser.add_argument('--d_z', type=int, default=8, help='latent dim placeholder')
 
-    # === 新增：趋势分解 / 趋势预测相关参数 ===
+    # trend decomposition / trend forecasting
     parser.add_argument('--trend_kernel', type=int, default=25, help='moving average kernel for trend decomposition')
     parser.add_argument('--trend_individual', type=bool, default=True, help='channel-wise trend linear head')
 
@@ -70,7 +66,7 @@ if __name__ == '__main__':
     parser.add_argument('--test_batch_size', type=int, default=8, help='batch size of test input data')
     parser.add_argument('--patience', type=int, default=15, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
-    parser.add_argument('--learning_rate_Cond', type=float, default=0.0001, help='not used in transition version')
+    parser.add_argument('--learning_rate_Cond', type=float, default=0.0001, help='not used in this version')
     parser.add_argument('--des', type=str, default='Exp', help='exp description')
     parser.add_argument('--loss', type=str, default='mse', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
@@ -80,7 +76,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--use_multi_gpu', type=bool, default=False, help='use multiple gpus')
-    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
+    parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multiple gpus')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
 
     # de-stationary projector params
@@ -94,7 +90,7 @@ if __name__ == '__main__':
     parser.add_argument('--cond_pred_model_pertrain_dir', type=str,
                         default='./checkpoints/cond_pred_model_pertrain_NS_Transformer/checkpoint.pth', help='')
 
-    parser.add_argument('--CART_input_x_embed_dim', type=int, default=32, help='feature dim for x in diffusion model')
+    parser.add_argument('--CART_input_x_embed_dim', type=int, default=32, help='history feature dim in diffusion model')
     parser.add_argument('--mse_timestep', type=int, default=0, help='')
     parser.add_argument('--MLP_diffusion_net', type=bool, default=False, help='use MLP or Unet')
     parser.add_argument('--timesteps', type=int, default=1000, help='diffusion timesteps')
@@ -104,21 +100,21 @@ if __name__ == '__main__':
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.seed == -1:
-        fix_seed = np.random.randint(2147483647)
+        fixed_seed = np.random.randint(2147483647)
     else:
-        fix_seed = args.seed
+        fixed_seed = args.seed
 
-    print('Using seed:', fix_seed)
+    print('Using seed:', fixed_seed)
 
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
+    random.seed(fixed_seed)
+    torch.manual_seed(fixed_seed)
+    np.random.seed(fixed_seed)
 
     if args.use_gpu:
         if args.use_multi_gpu:
             args.devices = args.devices.replace(' ', '')
             device_ids = args.devices.split(',')
-            args.device_ids = [int(id_) for id_ in device_ids]
+            args.device_ids = [int(device_id) for device_id in device_ids]
             args.gpu = args.device_ids[0]
         else:
             torch.cuda.set_device(args.gpu)
@@ -129,7 +125,7 @@ if __name__ == '__main__':
     Exp = Exp_Main
 
     if args.is_training:
-        for ii in range(args.itr):
+        for run_idx in range(args.itr):
             setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
                 args.model_id,
                 args.model,
@@ -146,7 +142,9 @@ if __name__ == '__main__':
                 args.factor,
                 args.embed,
                 args.distil,
-                args.des, ii)
+                args.des,
+                run_idx
+            )
 
             exp = Exp(args)
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -161,7 +159,7 @@ if __name__ == '__main__':
 
             torch.cuda.empty_cache()
     else:
-        ii = 0
+        run_idx = 0
         setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
             args.model_id,
             args.model,
@@ -178,7 +176,9 @@ if __name__ == '__main__':
             args.factor,
             args.embed,
             args.distil,
-            args.des, ii)
+            args.des,
+            run_idx
+        )
 
         exp = Exp(args)
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
