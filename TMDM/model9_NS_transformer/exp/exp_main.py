@@ -32,27 +32,33 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def ccc(id, pred, true):
-    res_box = np.zeros(len(true))
-    for i in range(len(true)):
-        res = pscore(pred[i], true[i]).compute()
-        res_box[i] = res[0]
-    return res_box
+def ccc(worker_id, generated_samples, ground_truth):
+    result_box = np.zeros(len(ground_truth))
+    for idx in range(len(ground_truth)):
+        result = pscore(generated_samples[idx], ground_truth[idx]).compute()
+        result_box[idx] = result[0]
+    return result_box
 
 
-def log_normal(x, mu, var):
+def log_normal(target_tensor, mean_tensor, variance_tensor):
     """
-    Logarithm of normal distribution with mean=mu and variance=var
+    Negative log-likelihood under a diagonal Gaussian.
     """
     eps = 1e-8
-    if isinstance(var, float):
-        var = torch.tensor(var, device=x.device, dtype=x.dtype)
+    if isinstance(variance_tensor, float):
+        variance_tensor = torch.tensor(
+            variance_tensor,
+            device=target_tensor.device,
+            dtype=target_tensor.dtype
+        )
 
     if eps > 0.0:
-        var = var + eps
+        variance_tensor = variance_tensor + eps
 
     return 0.5 * torch.mean(
-        np.log(2.0 * np.pi) + torch.log(var) + torch.pow(x - mu, 2) / var
+        np.log(2.0 * np.pi)
+        + torch.log(variance_tensor)
+        + torch.pow(target_tensor - mean_tensor, 2) / variance_tensor
     )
 
 
@@ -61,31 +67,22 @@ class Exp_Main(Exp_Basic):
         super(Exp_Main, self).__init__(args)
 
     def _build_model(self):
-        # diffusion model on residual space
-        model = diffuMTS.Model(self.args, self.device).float()
-
-        # 原 TMDM 的条件均值模型，现在改成 residual mean model
-        cond_pred_model = ns_Transformer.Model(self.args).float()
-
-        # 新增：趋势预测模型
+        residual_diffusion_model = diffuMTS.Model(self.args, self.device).float()
+        residual_prior_model = ns_Transformer.Model(self.args).float()
         trend_model = TrendLinear(self.args).float()
 
         if self.args.use_multi_gpu and self.args.use_gpu:
-            model = nn.DataParallel(model, device_ids=self.args.device_ids)
-            cond_pred_model = nn.DataParallel(cond_pred_model, device_ids=self.args.device_ids)
+            residual_diffusion_model = nn.DataParallel(residual_diffusion_model, device_ids=self.args.device_ids)
+            residual_prior_model = nn.DataParallel(residual_prior_model, device_ids=self.args.device_ids)
             trend_model = nn.DataParallel(trend_model, device_ids=self.args.device_ids)
 
-        return model, cond_pred_model, trend_model
+        return residual_diffusion_model, residual_prior_model, trend_model
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
         return data_set, data_loader
 
     def _select_optimizer(self):
-        # 过渡版：联合优化
-        # 1) diffusion model
-        # 2) residual mean model
-        # 3) trend model
         model_optim = optim.Adam(
             [
                 {'params': self.model.parameters()},
@@ -97,50 +94,42 @@ class Exp_Main(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        return nn.MSELoss()
 
-    def _prepare_transition_batch(self, batch_x, batch_y):
+    def _prepare_transition_batch(self, history_input, full_target):
         """
-        构造过渡版的核心训练对象：
-        1) x -> trend_x + residual_x
-        2) trend model predicts future trend
-        3) residual target = y - predicted trend context
+        Prepare transition-version training targets.
 
         Returns:
-            x_trend, x_residual,
-            pred_trend_future,
-            trend_full,
-            residual_y,
-            trend_target_future
+            history_trend
+            history_residual
+            future_trend_pred
+            full_trend_context
+            target_residual
+            future_trend_target
         """
-        # 历史序列分解
-        x_trend, x_residual = series_decomp(batch_x, self.args.trend_kernel)
+        history_trend, history_residual = series_decomp(history_input, self.args.trend_kernel)
 
-        # 未来目标的 trend target，仅用于监督趋势模型
-        y_trend_target_full = moving_average_trend(batch_y, self.args.trend_kernel)
-        trend_target_future = y_trend_target_full[:, -self.args.pred_len:, :]
+        full_target_trend = moving_average_trend(full_target, self.args.trend_kernel)
+        future_trend_target = full_target_trend[:, -self.args.pred_len:, :]
 
-        # 趋势模型只预测 future trend
-        pred_trend_future = self.trend_model(x_trend)
+        future_trend_pred = self.trend_model(history_trend)
 
-        # 构造 [label_len + pred_len] 的完整趋势上下文
-        trend_full = build_future_trend_context(
-            x_trend=x_trend,
-            pred_trend=pred_trend_future,
+        full_trend_context = build_future_trend_context(
+            history_trend=history_trend,
+            future_trend_pred=future_trend_pred,
             label_len=self.args.label_len
         )
 
-        # residual target 是“真实未来序列 - 预测趋势”
-        residual_y = batch_y - trend_full
+        target_residual = full_target - full_trend_context
 
         return (
-            x_trend,
-            x_residual,
-            pred_trend_future,
-            trend_full,
-            residual_y,
-            trend_target_future
+            history_trend,
+            history_residual,
+            future_trend_pred,
+            full_trend_context,
+            target_residual,
+            future_trend_target
         )
 
     def vali(self, vali_data, vali_loader, criterion):
@@ -150,94 +139,91 @@ class Exp_Main(Exp_Basic):
         self.trend_model.eval()
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+            for batch_idx, (history_input, full_target, history_mark, target_mark) in enumerate(vali_loader):
+                history_input = history_input.float().to(self.device)
+                full_target = full_target.float().to(self.device)
 
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                history_mark = history_mark.float().to(self.device)
+                target_mark = target_mark.float().to(self.device)
 
                 (
-                    x_trend,
-                    x_residual,
-                    pred_trend_future,
-                    trend_full,
-                    residual_y,
-                    trend_target_future
-                ) = self._prepare_transition_batch(batch_x, batch_y)
+                    history_trend,
+                    history_residual,
+                    future_trend_pred,
+                    full_trend_context,
+                    target_residual,
+                    future_trend_target
+                ) = self._prepare_transition_batch(history_input, full_target)
 
-                # residual decoder input
-                dec_inp_res = build_residual_decoder_input(
-                    x_residual=x_residual,
+                residual_decoder_input = build_residual_decoder_input(
+                    history_residual=history_residual,
                     pred_len=self.args.pred_len,
                     label_len=self.args.label_len
                 )
 
-                n = batch_x.size(0)
-                t = torch.randint(
-                    low=0, high=self.model.num_timesteps, size=(n // 2 + 1,)
+                batch_size = history_input.size(0)
+                step_ids = torch.randint(
+                    low=0, high=self.model.num_timesteps, size=(batch_size // 2 + 1,)
                 ).to(self.device)
-                t = torch.cat([t, self.model.num_timesteps - 1 - t], dim=0)[:n]
+                step_ids = torch.cat([step_ids, self.model.num_timesteps - 1 - step_ids], dim=0)[:batch_size]
 
-                # residual mean model（沿用 TMDM 的 condition model）
-                _, residual_mean_full, KL_loss, z_sample = self.cond_pred_model(
-                    x_residual, batch_x_mark, dec_inp_res, batch_y_mark
+                _, residual_prior_mean, kl_loss, latent_sample = self.cond_pred_model(
+                    history_residual, history_mark, residual_decoder_input, target_mark
                 )
 
-                # VAE-style condition loss（现在监督 residual）
-                loss_vae = log_normal(
-                    residual_y,
-                    residual_mean_full,
-                    torch.tensor(1.0, device=residual_y.device, dtype=residual_y.dtype)
+                residual_prior_loss = log_normal(
+                    target_residual,
+                    residual_prior_mean,
+                    torch.tensor(1.0, device=target_residual.device, dtype=target_residual.dtype)
                 )
-                loss_vae_all = loss_vae + self.args.k_z * KL_loss
+                residual_prior_loss_all = residual_prior_loss + self.args.k_z * kl_loss
 
-                # trend supervision
-                trend_loss = criterion(pred_trend_future, trend_target_future)
+                trend_loss = criterion(future_trend_pred, future_trend_target)
 
-                # TMDM diffusion in residual space:
-                # q(r_t | r_0, r_hat)
-                residual_T_mean = residual_mean_full
-                e = torch.randn_like(residual_y).to(self.device)
+                residual_prior_mean_T = residual_prior_mean
+                injected_noise = torch.randn_like(target_residual).to(self.device)
 
-                residual_t = q_sample(
-                    residual_y,
-                    residual_T_mean,
-                    self.model.alphas_bar_sqrt,
-                    self.model.one_minus_alphas_bar_sqrt,
-                    t,
-                    noise=e
+                noisy_residual_target = q_sample(
+                    clean_target=target_residual,
+                    prior_mean=residual_prior_mean_T,
+                    alphas_bar_sqrt=self.model.alphas_bar_sqrt,
+                    one_minus_alphas_bar_sqrt=self.model.one_minus_alphas_bar_sqrt,
+                    step_ids=step_ids,
+                    noise=injected_noise
                 )
 
-                output = self.model(
-                    x_residual,
-                    batch_x_mark,
-                    residual_y,
-                    residual_t,
-                    residual_mean_full,
-                    t
+                predicted_noise = self.model(
+                    history_residual,
+                    history_mark,
+                    target_residual,
+                    noisy_residual_target,
+                    residual_prior_mean,
+                    step_ids
                 )
 
-                diffusion_loss = (e - output).square().mean()
+                diffusion_loss = (injected_noise - predicted_noise).square().mean()
 
-                loss = diffusion_loss + self.args.k_cond * loss_vae_all + self.args.k_trend * trend_loss
-                total_loss.append(loss.detach().cpu().item())
+                total_batch_loss = (
+                    diffusion_loss
+                    + self.args.k_cond * residual_prior_loss_all
+                    + self.args.k_trend * trend_loss
+                )
+                total_loss.append(total_batch_loss.detach().cpu().item())
 
-        total_loss = np.average(total_loss)
+        avg_total_loss = np.average(total_loss)
         self.model.train()
         self.cond_pred_model.train()
         self.trend_model.train()
-        return total_loss
+        return avg_total_loss
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
-        path = os.path.join(self.args.checkpoints, setting)
-
-        if not os.path.exists(path):
-            os.makedirs(path)
+        checkpoint_dir = os.path.join(self.args.checkpoints, setting)
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
 
         time_now = time.time()
         train_steps = len(train_loader)
@@ -251,166 +237,162 @@ class Exp_Main(Exp_Basic):
 
         for epoch in range(self.args.train_epochs):
             epoch_time = time.time()
-
             iter_count = 0
-            train_loss = []
+            epoch_train_loss = []
 
             self.model.train()
             self.cond_pred_model.train()
             self.trend_model.train()
 
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            for batch_idx, (history_input, full_target, history_mark, target_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                history_input = history_input.float().to(self.device)
+                full_target = full_target.float().to(self.device)
+                history_mark = history_mark.float().to(self.device)
+                target_mark = target_mark.float().to(self.device)
 
                 (
-                    x_trend,
-                    x_residual,
-                    pred_trend_future,
-                    trend_full,
-                    residual_y,
-                    trend_target_future
-                ) = self._prepare_transition_batch(batch_x, batch_y)
+                    history_trend,
+                    history_residual,
+                    future_trend_pred,
+                    full_trend_context,
+                    target_residual,
+                    future_trend_target
+                ) = self._prepare_transition_batch(history_input, full_target)
 
-                dec_inp_res = build_residual_decoder_input(
-                    x_residual=x_residual,
+                residual_decoder_input = build_residual_decoder_input(
+                    history_residual=history_residual,
                     pred_len=self.args.pred_len,
                     label_len=self.args.label_len
                 )
 
-                n = batch_x.size(0)
-                t = torch.randint(
-                    low=0, high=self.model.num_timesteps, size=(n // 2 + 1,)
+                batch_size = history_input.size(0)
+                step_ids = torch.randint(
+                    low=0, high=self.model.num_timesteps, size=(batch_size // 2 + 1,)
                 ).to(self.device)
-                t = torch.cat([t, self.model.num_timesteps - 1 - t], dim=0)[:n]
+                step_ids = torch.cat([step_ids, self.model.num_timesteps - 1 - step_ids], dim=0)[:batch_size]
 
-                _, residual_mean_full, KL_loss, z_sample = self.cond_pred_model(
-                    x_residual, batch_x_mark, dec_inp_res, batch_y_mark
+                _, residual_prior_mean, kl_loss, latent_sample = self.cond_pred_model(
+                    history_residual, history_mark, residual_decoder_input, target_mark
                 )
 
-                # residual condition loss
-                loss_vae = log_normal(
-                    residual_y,
-                    residual_mean_full,
-                    torch.tensor(1.0, device=residual_y.device, dtype=residual_y.dtype)
+                residual_prior_loss = log_normal(
+                    target_residual,
+                    residual_prior_mean,
+                    torch.tensor(1.0, device=target_residual.device, dtype=target_residual.dtype)
                 )
-                loss_vae_all = loss_vae + self.args.k_z * KL_loss
+                residual_prior_loss_all = residual_prior_loss + self.args.k_z * kl_loss
 
-                # trend loss
-                trend_loss = criterion(pred_trend_future, trend_target_future)
+                trend_loss = criterion(future_trend_pred, future_trend_target)
 
-                residual_T_mean = residual_mean_full
-                e = torch.randn_like(residual_y).to(self.device)
+                residual_prior_mean_T = residual_prior_mean
+                injected_noise = torch.randn_like(target_residual).to(self.device)
 
-                residual_t = q_sample(
-                    residual_y,
-                    residual_T_mean,
-                    self.model.alphas_bar_sqrt,
-                    self.model.one_minus_alphas_bar_sqrt,
-                    t,
-                    noise=e
+                noisy_residual_target = q_sample(
+                    clean_target=target_residual,
+                    prior_mean=residual_prior_mean_T,
+                    alphas_bar_sqrt=self.model.alphas_bar_sqrt,
+                    one_minus_alphas_bar_sqrt=self.model.one_minus_alphas_bar_sqrt,
+                    step_ids=step_ids,
+                    noise=injected_noise
                 )
 
-                output = self.model(
-                    x_residual,
-                    batch_x_mark,
-                    residual_y,
-                    residual_t,
-                    residual_mean_full,
-                    t
+                predicted_noise = self.model(
+                    history_residual,
+                    history_mark,
+                    target_residual,
+                    noisy_residual_target,
+                    residual_prior_mean,
+                    step_ids
                 )
 
-                diffusion_loss = (e - output).square().mean()
+                diffusion_loss = (injected_noise - predicted_noise).square().mean()
 
-                # 总损失：
-                # 1) trend branch
-                # 2) residual mean branch
-                # 3) residual diffusion branch
-                loss = diffusion_loss + self.args.k_cond * loss_vae_all + self.args.k_trend * trend_loss
-                train_loss.append(loss.item())
+                total_batch_loss = (
+                    diffusion_loss
+                    + self.args.k_cond * residual_prior_loss_all
+                    + self.args.k_trend * trend_loss
+                )
+                epoch_train_loss.append(total_batch_loss.item())
 
-                if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                if (batch_idx + 1) % 100 == 0:
+                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(
+                        batch_idx + 1, epoch + 1, total_batch_loss.item()
+                    ))
                     speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - batch_idx)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                     iter_count = 0
                     time_now = time.time()
 
                 if self.args.use_amp:
-                    scaler.scale(loss).backward()
+                    scaler.scale(total_batch_loss).backward()
                     scaler.step(model_optim)
                     scaler.update()
                 else:
-                    loss.backward()
+                    total_batch_loss.backward()
                     model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
 
-            train_loss = np.average(train_loss)
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            avg_train_loss = np.average(epoch_train_loss)
+            avg_vali_loss = self.vali(vali_data, vali_loader, criterion)
+            avg_test_loss = self.vali(test_data, test_loader, criterion)
 
             print(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f}  Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                    epoch + 1, train_steps, train_loss, vali_loss, test_loss
+                    epoch + 1, train_steps, avg_train_loss, avg_vali_loss, avg_test_loss
                 )
             )
 
-            # 保存三个模型
-            if vali_loss <= getattr(self, "best_val_loss", 1e18):
-                self.best_val_loss = vali_loss
-                torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint_diffusion.pth'))
-                torch.save(self.cond_pred_model.state_dict(), os.path.join(path, 'checkpoint_cond.pth'))
-                torch.save(self.trend_model.state_dict(), os.path.join(path, 'checkpoint_trend.pth'))
-                print("Validation improved. Saved diffusion/cond/trend checkpoints.")
+            if avg_vali_loss <= getattr(self, "best_val_loss", 1e18):
+                self.best_val_loss = avg_vali_loss
+                torch.save(self.model.state_dict(), os.path.join(checkpoint_dir, 'checkpoint_diffusion.pth'))
+                torch.save(self.cond_pred_model.state_dict(), os.path.join(checkpoint_dir, 'checkpoint_cond.pth'))
+                torch.save(self.trend_model.state_dict(), os.path.join(checkpoint_dir, 'checkpoint_trend.pth'))
+                print("Validation improved. Saved diffusion / residual prior / trend checkpoints.")
 
-            early_stopping(vali_loss, self.model, path)
+            early_stopping(avg_vali_loss, self.model, checkpoint_dir)
 
-            if math.isnan(train_loss):
+            if math.isnan(avg_train_loss):
                 break
 
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
-        # 回载最优
-        diff_path = os.path.join(path, 'checkpoint_diffusion.pth')
-        cond_path = os.path.join(path, 'checkpoint_cond.pth')
-        trend_path = os.path.join(path, 'checkpoint_trend.pth')
+        diffusion_ckpt = os.path.join(checkpoint_dir, 'checkpoint_diffusion.pth')
+        cond_ckpt = os.path.join(checkpoint_dir, 'checkpoint_cond.pth')
+        trend_ckpt = os.path.join(checkpoint_dir, 'checkpoint_trend.pth')
 
-        if os.path.exists(diff_path):
-            self.model.load_state_dict(torch.load(diff_path, map_location=self.device))
-        if os.path.exists(cond_path):
-            self.cond_pred_model.load_state_dict(torch.load(cond_path, map_location=self.device))
-        if os.path.exists(trend_path):
-            self.trend_model.load_state_dict(torch.load(trend_path, map_location=self.device))
+        if os.path.exists(diffusion_ckpt):
+            self.model.load_state_dict(torch.load(diffusion_ckpt, map_location=self.device))
+        if os.path.exists(cond_ckpt):
+            self.cond_pred_model.load_state_dict(torch.load(cond_ckpt, map_location=self.device))
+        if os.path.exists(trend_ckpt):
+            self.trend_model.load_state_dict(torch.load(trend_ckpt, map_location=self.device))
 
         return self.model
 
     def test(self, setting, test=0):
-        #####################################################################################################
-        ########################## local functions within the class function scope ##########################
-
-        def store_gen_y_at_step_t(config, config_diff, idx, y_tile_seq):
-            current_t = self.model.num_timesteps - idx
-            gen_y = y_tile_seq[idx].reshape(
+        def store_generated_target_at_step(config, diffusion_config, reverse_index, generated_target_sequence):
+            current_step = self.model.num_timesteps - reverse_index
+            generated_target = generated_target_sequence[reverse_index].reshape(
                 config.test_batch_size,
-                int(config_diff.testing.n_z_samples / config_diff.testing.n_z_samples_depart),
+                int(diffusion_config.testing.n_z_samples / diffusion_config.testing.n_z_samples_depart),
                 (config.label_len + config.pred_len),
                 config.c_out
             ).cpu().numpy()
 
-            if len(gen_y_by_batch_list[current_t]) == 0:
-                gen_y_by_batch_list[current_t] = gen_y
+            if len(generated_target_by_batch[current_step]) == 0:
+                generated_target_by_batch[current_step] = generated_target
             else:
-                gen_y_by_batch_list[current_t] = np.concatenate([gen_y_by_batch_list[current_t], gen_y], axis=0)
-            return gen_y
+                generated_target_by_batch[current_step] = np.concatenate(
+                    [generated_target_by_batch[current_step], generated_target], axis=0
+                )
+            return generated_target
 
         def compute_true_coverage_by_gen_QI(config, dataset_object, all_true_y, all_generated_y):
             n_bins = config.testing.n_bins
@@ -427,7 +409,7 @@ class Exp_Main(Exp_Basic):
             y_true_quantile_bin_count[-2] += y_true_quantile_bin_count[-1]
             y_true_quantile_bin_count_ = y_true_quantile_bin_count[1:-1]
             y_true_ratio_by_bin = y_true_quantile_bin_count_ / dataset_object
-            assert np.abs(np.sum(y_true_ratio_by_bin) - 1) < 1e-10, "Sum of quantile coverage ratios shall be 1!"
+            assert np.abs(np.sum(y_true_ratio_by_bin) - 1) < 1e-10
             qice_coverage_ratio = np.absolute(np.ones(n_bins) / n_bins - y_true_ratio_by_bin).mean()
             return y_true_ratio_by_bin, qice_coverage_ratio, y_true
 
@@ -445,17 +427,17 @@ class Exp_Main(Exp_Basic):
 
         if test:
             print('loading model')
-            path = os.path.join('./checkpoints/', setting)
-            self.model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_diffusion.pth'), map_location=self.device))
-            self.cond_pred_model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_cond.pth'), map_location=self.device))
-            self.trend_model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_trend.pth'), map_location=self.device))
+            checkpoint_dir = os.path.join('./checkpoints/', setting)
+            self.model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_diffusion.pth'), map_location=self.device))
+            self.cond_pred_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_cond.pth'), map_location=self.device))
+            self.trend_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_trend.pth'), map_location=self.device))
 
-        preds = []
-        trues = []
+        all_preds = []
+        all_trues = []
 
-        folder_path = './test_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        test_result_dir = './test_results/' + setting + '/'
+        if not os.path.exists(test_result_dir):
+            os.makedirs(test_result_dir)
 
         minibatch_sample_start = time.time()
 
@@ -464,243 +446,237 @@ class Exp_Main(Exp_Basic):
         self.trend_model.eval()
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                gen_y_by_batch_list = [[] for _ in range(self.model.num_timesteps + 1)]
-                y_se_by_batch_list = [[] for _ in range(self.model.num_timesteps + 1)]
+            for batch_idx, (history_input, full_target, history_mark, target_mark) in enumerate(test_loader):
+                generated_target_by_batch = [[] for _ in range(self.model.num_timesteps + 1)]
 
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                history_input = history_input.float().to(self.device)
+                full_target = full_target.float().to(self.device)
 
-                # === 1) trend / residual decomposition ===
-                x_trend, x_residual = series_decomp(batch_x, self.args.trend_kernel)
+                history_mark = history_mark.float().to(self.device)
+                target_mark = target_mark.float().to(self.device)
 
-                # === 2) trend prediction ===
-                pred_trend_future = self.trend_model(x_trend)  # [B, pred_len, C]
-                trend_full = build_future_trend_context(
-                    x_trend=x_trend,
-                    pred_trend=pred_trend_future,
+                history_trend, history_residual = series_decomp(history_input, self.args.trend_kernel)
+
+                future_trend_pred = self.trend_model(history_trend)
+                full_trend_context = build_future_trend_context(
+                    history_trend=history_trend,
+                    future_trend_pred=future_trend_pred,
                     label_len=self.args.label_len
                 )
 
-                # === 3) residual mean prediction ===
-                dec_inp_res = build_residual_decoder_input(
-                    x_residual=x_residual,
+                residual_decoder_input = build_residual_decoder_input(
+                    history_residual=history_residual,
                     pred_len=self.args.pred_len,
                     label_len=self.args.label_len
                 )
 
-                _, residual_mean_full, _, z_sample = self.cond_pred_model(
-                    x_residual, batch_x_mark, dec_inp_res, batch_y_mark
+                _, residual_prior_mean, _, latent_sample = self.cond_pred_model(
+                    history_residual, history_mark, residual_decoder_input, target_mark
                 )
 
                 repeat_n = int(
-                    self.model.diffusion_config.testing.n_z_samples / self.model.diffusion_config.testing.n_z_samples_depart
+                    self.model.diffusion_config.testing.n_z_samples /
+                    self.model.diffusion_config.testing.n_z_samples_depart
                 )
 
-                residual_mean_tile = residual_mean_full.repeat(repeat_n, 1, 1, 1)
-                residual_mean_tile = residual_mean_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+                tiled_residual_prior_mean = residual_prior_mean.repeat(repeat_n, 1, 1, 1)
+                tiled_residual_prior_mean = tiled_residual_prior_mean.transpose(0, 1).flatten(0, 1).to(self.device)
 
-                residual_T_mean_tile = residual_mean_tile
+                tiled_residual_prior_mean_T = tiled_residual_prior_mean
 
-                x_tile = x_residual.repeat(repeat_n, 1, 1, 1)
-                x_tile = x_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+                tiled_history_residual = history_residual.repeat(repeat_n, 1, 1, 1)
+                tiled_history_residual = tiled_history_residual.transpose(0, 1).flatten(0, 1).to(self.device)
 
-                x_mark_tile = batch_x_mark.repeat(repeat_n, 1, 1, 1)
-                x_mark_tile = x_mark_tile.transpose(0, 1).flatten(0, 1).to(self.device)
+                tiled_history_mark = history_mark.repeat(repeat_n, 1, 1, 1)
+                tiled_history_mark = tiled_history_mark.transpose(0, 1).flatten(0, 1).to(self.device)
 
-                gen_y_box = []
+                generated_residual_box = []
                 for _ in range(self.model.diffusion_config.testing.n_z_samples_depart):
                     for _ in range(self.model.diffusion_config.testing.n_z_samples_depart):
-                        y_tile_seq = p_sample_loop(
+                        generated_residual_sequence = p_sample_loop(
                             self.model,
-                            x_tile,
-                            x_mark_tile,
-                            residual_mean_tile,
-                            residual_T_mean_tile,
+                            tiled_history_residual,
+                            tiled_history_mark,
+                            tiled_residual_prior_mean,
+                            tiled_residual_prior_mean_T,
                             self.model.num_timesteps,
                             self.model.alphas,
                             self.model.one_minus_alphas_bar_sqrt
                         )
 
-                    gen_residual = store_gen_y_at_step_t(
+                    generated_residual = store_generated_target_at_step(
                         config=self.model.args,
-                        config_diff=self.model.diffusion_config,
-                        idx=self.model.num_timesteps,
-                        y_tile_seq=y_tile_seq
+                        diffusion_config=self.model.diffusion_config,
+                        reverse_index=self.model.num_timesteps,
+                        generated_target_sequence=generated_residual_sequence
                     )
-                    gen_y_box.append(gen_residual)
+                    generated_residual_box.append(generated_residual)
 
-                # [B, n_samples, label+pred, C]
-                outputs_residual = np.concatenate(gen_y_box, axis=1)
+                generated_residual = np.concatenate(generated_residual_box, axis=1)
 
-                f_dim = -1 if self.args.features == 'MS' else 0
+                feature_dim = -1 if self.args.features == 'MS' else 0
 
-                # crop future residual
-                outputs_residual = outputs_residual[:, :, -self.args.pred_len:, f_dim:]
+                generated_residual = generated_residual[:, :, -self.args.pred_len:, feature_dim:]
+                future_trend_np = future_trend_pred[:, :, feature_dim:].detach().cpu().numpy()
 
-                # add future trend back
-                trend_future_np = pred_trend_future[:, :, f_dim:].detach().cpu().numpy()
-                outputs = outputs_residual + trend_future_np[:, None, :, :]
+                # final prediction = trend prediction + generated residual
+                final_prediction = generated_residual + future_trend_np[:, None, :, :]
 
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                batch_y = batch_y.detach().cpu().numpy()
+                full_target = full_target[:, -self.args.pred_len:, feature_dim:].to(self.device)
+                full_target = full_target.detach().cpu().numpy()
 
-                pred = outputs
-                true = batch_y
+                all_preds.append(final_prediction)
+                all_trues.append(full_target)
 
-                preds.append(pred)
-                trues.append(true)
-
-                if i % 5 == 0 and i != 0:
+                if batch_idx % 5 == 0 and batch_idx != 0:
                     print('Testing: %d/%d cost time: %f min' % (
-                        i, len(test_loader), (time.time() - minibatch_sample_start) / 60))
+                        batch_idx, len(test_loader), (time.time() - minibatch_sample_start) / 60))
                     minibatch_sample_start = time.time()
 
-        preds = np.array(preds)
-        trues = np.array(trues)
+        all_preds = np.array(all_preds)
+        all_trues = np.array(all_trues)
 
-        preds_save = np.array(preds)
-        trues_save = np.array(trues)
+        all_preds_save = np.array(all_preds)
+        all_trues_save = np.array(all_trues)
 
-        preds_ns = np.array(preds).mean(axis=2)
-        print('test shape:', preds_ns.shape, trues.shape)
-        preds_ns = preds_ns.reshape(-1, preds_ns.shape[-2], preds_ns.shape[-1])
-        trues_ns = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-        print('test shape:', preds_ns.shape, trues_ns.shape)
+        point_prediction = np.array(all_preds).mean(axis=2)
+        print('test shape:', point_prediction.shape, all_trues.shape)
 
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        point_prediction = point_prediction.reshape(-1, point_prediction.shape[-2], point_prediction.shape[-1])
+        all_trues_point = all_trues.reshape(-1, all_trues.shape[-2], all_trues.shape[-1])
+        print('test shape:', point_prediction.shape, all_trues_point.shape)
 
-        mae, mse, rmse, mape, mspe = metric(preds_ns, trues_ns)
+        result_dir = './results/' + setting + '/'
+        if not os.path.exists(result_dir):
+            os.makedirs(result_dir)
+
+        mae, mse, rmse, mape, mspe = metric(point_prediction, all_trues_point)
         print('Transition-TMDM metric: mse:{:.4f}, mae:{:.4f}, rmse:{:.4f}, mape:{:.4f}, mspe:{:.4f}'.format(
             mse, mae, rmse, mape, mspe))
 
-        preds = preds.reshape(-1, preds.shape[-3], preds.shape[-2] * preds.shape[-1])
-        preds = preds.transpose(0, 2, 1)
-        preds = preds.reshape(-1, preds.shape[-1])
+        flattened_preds = all_preds.reshape(-1, all_preds.shape[-3], all_preds.shape[-2] * all_preds.shape[-1])
+        flattened_preds = flattened_preds.transpose(0, 2, 1)
+        flattened_preds = flattened_preds.reshape(-1, flattened_preds.shape[-1])
 
-        trues = trues.reshape(-1, 1, trues.shape[-2] * trues.shape[-1])
-        trues = trues.transpose(0, 2, 1)
-        trues = trues.reshape(-1, trues.shape[-1])
+        flattened_trues = all_trues.reshape(-1, 1, all_trues.shape[-2] * all_trues.shape[-1])
+        flattened_trues = flattened_trues.transpose(0, 2, 1)
+        flattened_trues = flattened_trues.reshape(-1, flattened_trues.shape[-1])
 
         y_true_ratio_by_bin, qice_coverage_ratio, y_true = compute_true_coverage_by_gen_QI(
             config=self.model.diffusion_config,
-            dataset_object=preds.shape[0],
-            all_true_y=trues,
-            all_generated_y=preds,
+            dataset_object=flattened_preds.shape[0],
+            all_true_y=flattened_trues,
+            all_generated_y=flattened_preds,
         )
 
-        coverage, _, _ = compute_PICP(config=self.model.diffusion_config, y_true=y_true, all_gen_y=preds)
+        coverage, _, _ = compute_PICP(
+            config=self.model.diffusion_config,
+            y_true=y_true,
+            all_gen_y=flattened_preds
+        )
 
         print('CARD/TMDM metric: QICE:{:.4f}%, PICP:{:.4f}%'.format(qice_coverage_ratio * 100, coverage * 100))
 
-        pred = preds_save.reshape(-1, preds_save.shape[-3], preds_save.shape[-2], preds_save.shape[-1])
-        true = trues_save.reshape(-1, trues_save.shape[-2], trues_save.shape[-1])
+        pred_for_crps = all_preds_save.reshape(-1, all_preds_save.shape[-3], all_preds_save.shape[-2], all_preds_save.shape[-1])
+        true_for_crps = all_trues_save.reshape(-1, all_trues_save.shape[-2], all_trues_save.shape[-1])
 
         pool = Pool(processes=32)
-        all_res = []
-        for i in range(pred.shape[-1]):
-            p_in = pred[:, :, :, i]
-            p_in = p_in.transpose(0, 2, 1)
-            p_in = p_in.reshape(-1, p_in.shape[-1])
+        crps_worker_results = []
+        for feature_idx in range(pred_for_crps.shape[-1]):
+            generated_feature = pred_for_crps[:, :, :, feature_idx]
+            generated_feature = generated_feature.transpose(0, 2, 1)
+            generated_feature = generated_feature.reshape(-1, generated_feature.shape[-1])
 
-            t_in = true[:, :, i]
-            t_in = t_in.reshape(-1)
-            all_res.append(pool.apply_async(ccc, args=(i, p_in, t_in)))
+            true_feature = true_for_crps[:, :, feature_idx]
+            true_feature = true_feature.reshape(-1)
+            crps_worker_results.append(pool.apply_async(ccc, args=(feature_idx, generated_feature, true_feature)))
 
-        p_in = np.sum(pred, axis=-1)
-        p_in = p_in.transpose(0, 2, 1)
-        p_in = p_in.reshape(-1, p_in.shape[-1])
+        generated_sum = np.sum(pred_for_crps, axis=-1)
+        generated_sum = generated_sum.transpose(0, 2, 1)
+        generated_sum = generated_sum.reshape(-1, generated_sum.shape[-1])
 
-        t_in = np.sum(true, axis=-1)
-        t_in = t_in.reshape(-1)
+        true_sum = np.sum(true_for_crps, axis=-1)
+        true_sum = true_sum.reshape(-1)
 
-        CRPS_sum = pool.apply_async(ccc, args=(8, p_in, t_in))
+        crps_sum_async = pool.apply_async(ccc, args=(8, generated_sum, true_sum))
 
         pool.close()
         pool.join()
 
-        all_res_get = []
-        for i in range(len(all_res)):
-            all_res_get.append(all_res[i].get())
-        all_res_get = np.array(all_res_get)
+        crps_feature_values = []
+        for result_idx in range(len(crps_worker_results)):
+            crps_feature_values.append(crps_worker_results[result_idx].get())
+        crps_feature_values = np.array(crps_feature_values)
 
-        CRPS_0 = np.mean(all_res_get, axis=0).mean()
-        CRPS_sum = CRPS_sum.get().mean()
+        crps_mean = np.mean(crps_feature_values, axis=0).mean()
+        crps_sum = crps_sum_async.get().mean()
 
-        print('CRPS', CRPS_0, 'CRPS_sum', CRPS_sum)
+        print('CRPS', crps_mean, 'CRPS_sum', crps_sum)
 
-        f = open("result.txt", 'a')
-        f.write(setting + "  \n")
-        f.write('mse:{}, mae:{}'.format(mse, mae))
-        f.write('\n')
-        f.write('\n')
-        f.close()
+        with open("result.txt", 'a') as result_file:
+            result_file.write(setting + "  \n")
+            result_file.write('mse:{}, mae:{}'.format(mse, mae))
+            result_file.write('\n\n')
 
-        np.save(folder_path + 'metrics.npy',
-                np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, CRPS_0, CRPS_sum]))
-        np.save(folder_path + 'pred.npy', preds_save)
-        np.save(folder_path + 'true.npy', trues_save)
+        np.save(result_dir + 'metrics.npy',
+                np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, crps_mean, crps_sum]))
+        np.save(result_dir + 'pred.npy', all_preds_save)
+        np.save(result_dir + 'true.npy', all_trues_save)
 
         np.save("./results/{}.npy".format(self.args.model_id), np.array(mse))
         np.save("./results/{}_Ntimes.npy".format(self.args.model_id),
-                np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, CRPS_0, CRPS_sum]))
+                np.array([mse, mae, rmse, mape, mspe, qice_coverage_ratio * 100, coverage * 100, crps_mean, crps_sum]))
 
         return
 
     def predict(self, setting, load=False):
         """
-        简化版 predict：
-        使用 trend prediction + residual mean prediction，
-        不走 diffusion 采样。
-        如果你需要正式预测，建议复用 test() 里的采样流程。
+        Simplified predict:
+        future prediction = future trend prediction + residual prior mean.
         """
         pred_data, pred_loader = self._get_data(flag='pred')
 
         if load:
-            path = os.path.join(self.args.checkpoints, setting)
-            self.model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_diffusion.pth'), map_location=self.device))
-            self.cond_pred_model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_cond.pth'), map_location=self.device))
-            self.trend_model.load_state_dict(torch.load(os.path.join(path, 'checkpoint_trend.pth'), map_location=self.device))
+            checkpoint_dir = os.path.join(self.args.checkpoints, setting)
+            self.model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_diffusion.pth'), map_location=self.device))
+            self.cond_pred_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_cond.pth'), map_location=self.device))
+            self.trend_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'checkpoint_trend.pth'), map_location=self.device))
 
-        preds = []
+        all_preds = []
 
         self.model.eval()
         self.cond_pred_model.eval()
         self.trend_model.eval()
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+            for batch_idx, (history_input, full_target, history_mark, target_mark) in enumerate(pred_loader):
+                history_input = history_input.float().to(self.device)
+                history_mark = history_mark.float().to(self.device)
+                target_mark = target_mark.float().to(self.device)
 
-                x_trend, x_residual = series_decomp(batch_x, self.args.trend_kernel)
-                pred_trend_future = self.trend_model(x_trend)
+                history_trend, history_residual = series_decomp(history_input, self.args.trend_kernel)
+                future_trend_pred = self.trend_model(history_trend)
 
-                dec_inp_res = build_residual_decoder_input(
-                    x_residual=x_residual,
+                residual_decoder_input = build_residual_decoder_input(
+                    history_residual=history_residual,
                     pred_len=self.args.pred_len,
                     label_len=self.args.label_len
                 )
 
-                _, residual_mean_full, _, _ = self.cond_pred_model(
-                    x_residual, batch_x_mark, dec_inp_res, batch_y_mark
+                _, residual_prior_mean, _, _ = self.cond_pred_model(
+                    history_residual, history_mark, residual_decoder_input, target_mark
                 )
 
-                pred = pred_trend_future + residual_mean_full[:, -self.args.pred_len:, :]
-                pred = pred.detach().cpu().numpy()
-                preds.append(pred)
+                future_prediction = future_trend_pred + residual_prior_mean[:, -self.args.pred_len:, :]
+                future_prediction = future_prediction.detach().cpu().numpy()
+                all_preds.append(future_prediction)
 
-        preds = np.array(preds)
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+        all_preds = np.array(all_preds)
+        all_preds = all_preds.reshape(-1, all_preds.shape[-2], all_preds.shape[-1])
 
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        result_dir = './results/' + setting + '/'
+        if not os.path.exists(result_dir):
+            os.makedirs(result_dir)
 
-        np.save(folder_path + 'real_prediction.npy', preds)
+        np.save(result_dir + 'real_prediction.npy', all_preds)
         return
